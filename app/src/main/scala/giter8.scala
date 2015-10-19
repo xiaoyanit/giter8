@@ -1,55 +1,94 @@
 package giter8
 
-class Giter8 extends xsbti.AppMain with Discover with Apply {
+class Giter8 extends xsbti.AppMain with Apply {
   import dispatch._
 
-  val Repo = """^(\S+)/(\S+?)(?:\.g8)?$""".r
-  val RemoteTemplates = """^-(l|-list)$""".r
-  
   java.util.logging.Logger.getLogger("").setLevel(java.util.logging.Level.SEVERE)
-  
-  def run(config: xsbti.AppConfiguration) =
-    (config.arguments.partition { s => Param.pattern.matcher(s).matches } match {
-      case (params, Array(Repo(user, proj))) => inspect("%s/%s.g8".format(user, proj), params)
-      case (_, Array(RemoteTemplates(_), query)) => discover(Some(query))
-      case (_, Array(RemoteTemplates(_))) => discover(None)
-      case _ => Left(usage)
-    }) fold ({ error =>
-      System.err.println("\n%s\n" format error)
-      new Exit(1)
-    }, { message =>
-      println("\n%s\n" format message)
-      new Exit(0)
-    })
-  
-  class Exit(val code: Int) extends xsbti.Exit
-  
-  val gh = :/("github.com") / "api" / "v2" / "json"
 
-  def http = new Http {
-    override def make_logger = new dispatch.Logger {
-      val jdklog = java.util.logging.Logger.getLogger("dispatch")
-      def info(msg: String, items: Any*) { 
-        jdklog.info(msg.format(items: _*)) 
-      }
-    }
+  /** The launched conscript entry point */
+  def run(config: xsbti.AppConfiguration): Exit =
+    new Exit(Giter8.run(config.arguments))
+
+  /** Runner shared my main-class runner */
+  def run(args: Array[String]): Int = {
+    val result = (args.partition { s =>
+      G8Helpers.Param.pattern.matcher(s).matches
+    } match {
+      case (params, options) =>
+        parser.parse(options, Config()).map { config =>
+          if (config.search)
+            search(config)
+          else
+            inspect(config, params)
+        }.getOrElse(Left(""))
+      case _ => Left(parser.usage)
+    })
+    cleanup()
+    result.fold ({ (error: String) =>
+      System.err.println(s"\n$error\n")
+      1
+    }, { (message: String) =>
+      println("\n%s\n" format message )
+      0
+    })
   }
-  def usage = """Usage: g8 [TEMPLATE] [OPTION]...
-                |Apply specified template or list available templates.
-                |
-                |OPTIONS
-                |    -l, --list
-                |        List current giter8 templates on github.
-                |
-                |    --paramname=paramvalue
-                |        Set given parameter value and bypass interaction.
-                |
-                |Apply template and interactively fulfill parameters.
-                |    g8 n8han/giter8
-                |
-                |Apply given name parameter and use defaults for all others.
-                |    g8 n8han/giter8 --name=template-test
-                |
-                |List available templates.
-                |    g8 --list""".stripMargin
+
+  val parser = new scopt.OptionParser[Config]("giter8") {
+    head("g8", giter8.BuildInfo.version)
+    cmd("search") action { (_, config) =>
+      config.copy(search = true)
+    } text("Search for templates on github")
+    arg[String]("<template>") action { (repo, config) =>
+      config.copy(repo = repo)
+    } text ("git or file URL, or github user/repo")
+    opt[String]('b', "branch") action { (b, config) => 
+      config.copy(branch = Some(b))
+    } text("Resolve a template within a given branch")
+    opt[String]('t', "tag") action { (t, config) =>
+      if (config.branch.nonEmpty) {
+        System.err.println("\nDo not specify branch and tag in the meantime\n")
+        System.exit(1)
+      }
+      config.copy(tag = Some(t))
+    } text("Resolve a template within a given tag")
+    opt[Unit]('f', "force") action { (_, config) =>
+      config.copy(forceOverwrite = true)
+    } text("Force overwrite of any existing files in output directory")
+    note("""  --paramname=paramvalue
+      |        Set given parameter value and bypass interaction.
+      |
+      |EXAMPLES
+      |
+      |Apply a template from github
+      |    g8 n8han/giter8
+      |
+      |Apply using the git URL for the same template
+      |    g8 git://github.com/n8han/giter8.git
+      |
+      |Apply template from a remote branch
+      |    g8 n8han/giter8 -b some-branch
+      |
+      |Apply template from a remote tag
+      |    g8 n8han/giter8 -t some-tag
+      |
+      |Apply template from a local repo
+      |    g8 file://path/to/the/repo
+      |
+      |Apply given name parameter and use defaults for all others.
+      |    g8 n8han/giter8 --name=template-test""".stripMargin)
+  }
+}
+
+class Exit(val code: Int) extends xsbti.Exit
+
+object Giter8 extends Giter8 {
+  import java.io.File
+  val home = Option(System.getProperty("G8_HOME")).map(new File(_)).getOrElse(
+    new File(System.getProperty("user.home"), ".g8")
+  )
+
+  /** Main-class runner just for testing from sbt*/
+  def main(args: Array[String]) {
+    System.exit(run(args))
+  }
 }

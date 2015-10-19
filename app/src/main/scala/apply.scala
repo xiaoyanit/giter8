@@ -1,96 +1,160 @@
 package giter8
 
+import org.eclipse.jgit.transport._
+  
 trait Apply { self: Giter8 =>
-  import dispatch._
-  import dispatch.liftjson.Js._
-  import net.liftweb.json.JsonAST._
-  import scala.collection.JavaConversions._
-  import java.io.{File,FileWriter}
+  import java.io.File
+  import org.apache.commons.io.FileUtils
+  import org.eclipse.jgit.api._
+  import scala.util.control.Exception.{allCatch,catching}
 
-  val Root = "^src/main/g8/(.+)$".r
-  val Param = """^--(\S+)=(.+)$""".r
+  private val tempdir =
+    new File(FileUtils.getTempDirectory, "giter8-" + System.nanoTime)
 
-  def inspect(repo: String, params: Iterable[String]) =
-    repo_files(repo).right.flatMap { repo_files =>
-      val (default_props, templates) = repo_files.partition { 
-        case (name, _) => name == "default.properties" 
-      }
-      val default_params = defaults(repo, default_props)
-      val parameters = 
-        if (params.isEmpty) interact(default_params)
-        else (defaults(repo, default_props) /: params) { 
-          case (map, Param(key, value)) if map.contains(key) => 
-            map + (key -> value)
-          case (map, Param(key, _)) =>
-            println("Ignoring unregonized parameter: " + key)
-            map
-        }
-      val base = new File(parameters.get("name").map(normalize).getOrElse("."))
-      write(repo, templates, parameters, base)
-    }
-
-  def repo_files(repo: String) = try { Right(for {
-    blobs <- http(gh / "blob" / "all" / repo / "master" ># ('blobs ? obj))
-    JField(name, JString(hash)) <- blobs
-    m <- Root.findFirstMatchIn(name)
-  } yield (m.group(1), hash)) } catch {
-    case StatusCode(404, _) => Left("Unable to find github repository: %s" format repo)
+  /** Clean temporary directory used for git cloning */
+  def cleanup() {
+    if (tempdir.exists)
+      FileUtils.forceDelete(tempdir)
   }
 
-  def defaults(repo: String, default_props: Iterable[(String, String)]) = 
-    default_props.map { case (_, hash) => 
-      http(show(repo, hash) >> { stm =>
-        val p = new java.util.Properties
-        p.load(stm)
-        (Map.empty[String, String] /: p.propertyNames) { (m, k) =>
-          m + (k.toString -> p.getProperty(k.toString))
-        }
-      } )
-    }.headOption getOrElse Map.empty[String, String]
+  val GitHub = """^([^\s/]+)/([^\s/]+?)(?:\.g8)?$""".r
+  val Local = """^file://(\S+)$""".r
 
-  def interact(params: Map[String, String]) = {
-    val (desc, others) = params partition { case (k,_) => k == "description" }
-    desc.values.foreach { d => 
-      @scala.annotation.tailrec 
-      def liner(cursor: Int, rem: Iterable[String]) {
-        if (!rem.isEmpty) {
-          val next = cursor + 1 + rem.head.length
-          if (next > 70) {
-            println()
-            liner(0, rem)
-          } else {
-            print(rem.head + " ")
-            liner(next, rem.tail)
-          }
+  object GitUrl {
+    val NativeUrl = "^(git[@|://].*)$".r
+    val HttpsUrl = "^(https://.*)$".r
+    val HttpUrl = "^(http://.*)$".r
+
+    def unapplySeq(s: Any): Option[List[String]] =
+      NativeUrl.unapplySeq(s) orElse
+      HttpsUrl.unapplySeq(s) orElse
+      HttpUrl.unapplySeq(s)
+  }
+
+  def search(config: Config): Either[String, String] = {
+    val prettyPrinter = (repo: GithubRepo) =>
+      "%s \n\t %s\n" format (repo.name, repo.description)
+
+    val repos = GithubRepo.search(config.repo)
+
+    Right(repos.map(prettyPrinter).mkString(""))
+  }
+
+  def inspect(config: Config,
+              arguments: Seq[String]): Either[String, String] = {
+    config.repo match {
+      case Local(path) =>
+        val tmpl = config.branch.map { _ =>
+          clone(path, config)
+        }.getOrElse(copy(path))
+        tmpl.right.flatMap { t =>
+          G8Helpers.applyTemplate(t, new File("."), arguments, config.forceOverwrite)
         }
-      }
-      println()
-      liner(0, d.split(" "))
-      println("\n")
-    }
-    others map { case (k,v) =>
-      val in = Console.readLine("%s [%s]: ", k,v).trim
-      (k, if (in.isEmpty) v else in)
+      case GitUrl(uri) =>
+        val tmpl = clone(uri, config)
+        tmpl.right.flatMap { t =>
+          G8Helpers.applyTemplate(t,
+            new File("."),
+            arguments,
+            config.forceOverwrite
+          )
+        }
+      case GitHub(user, proj) =>
+        try {
+          val publicConfig = config.copy(
+            repo = "git://github.com/%s/%s.g8.git".format(user, proj)
+          )
+          inspect(publicConfig, arguments)
+        } catch {
+          case _: org.eclipse.jgit.api.errors.JGitInternalException =>
+            // assume it was an access failure, try with ssh
+            // after cleaning the clone directory
+            val privateConfig = config.copy(
+              repo = "git@github.com:%s/%s.g8.git".format(user, proj)
+            )
+            cleanup()
+            inspect(privateConfig, arguments)
+        }
     }
   }
 
-  def write(repo: String, templates: Iterable[(String, String)], parameters: Map[String,String], base: File) = {
-    templates foreach { case (name, hash) =>
-      import org.clapper.scalasti.StringTemplate
-      val f = new File(base, new StringTemplate(name).setAttributes(parameters).toString)
-      if (f.exists)
-        println("Skipping existing file: " + f.toString)
-      else {
-        f.getParentFile.mkdirs()
-        http(show(repo, hash) >- { in =>
-          val fw = new FileWriter(f)
-          fw.write(new StringTemplate(in).setAttributes(parameters).toString)
-          fw.close()
-        })
+  def clone(repo: String, config: Config) = {
+    import org.eclipse.jgit.api.ListBranchCommand.ListMode
+    import org.eclipse.jgit.lib._
+    import scala.collection.JavaConverters._
+
+    val cmd = Git.cloneRepository()
+      .setURI(repo)
+      .setDirectory(tempdir)
+      .setCredentialsProvider(ConsoleCredentialsProvider)
+
+    val branchName = config.branch.map("refs/heads/" + _)
+
+    branchName.foreach(cmd.setBranch)
+
+    val g = cmd.call()
+
+    val result = branchName.map { b =>
+      if(g.getRepository.getFullBranch.equals(b))
+        Right(tempdir)
+      else
+        Left("Branch not found: " + b)
+    } orElse config.tag.map{ t =>
+      if (g.getRepository.getTags.containsKey(t)) {
+        g.checkout().setName(t).call()
+        Right(tempdir)
+      } else {
+        Left(s"Tag not found: refs/tags/$t")
       }
-    }
-    Right("Applied %s in %s" format (repo, base.toString))
+    } getOrElse(Right(tempdir))
+
+    g.getRepository.close()
+    result
   }
-  def normalize(s: String) = s.toLowerCase.replaceAll("""\s+""", "-")
-  def show(repo: String, hash: String) = gh / "blob" / "show" / repo / hash
+
+  /** for file:// repositories with no named branch, just do a file copy */
+  def copy(filename: String) = {
+    val dir = new File(filename)
+    if (!dir.isDirectory)
+      Left("Not a readable directory: " + filename)
+    else {
+      FileUtils.copyDirectory(dir, tempdir)
+      Right(tempdir)
+    }
+  }
+}
+
+object ConsoleCredentialsProvider extends CredentialsProvider {
+  
+  def isInteractive = true
+  
+  def supports(items: CredentialItem*) = true
+  
+  def get(uri: URIish, items: CredentialItem*) = {
+    items foreach { 
+      case i: CredentialItem.Username =>
+        val username = System.console.readLine("%s: ", i.getPromptText)
+        i.setValue(username)
+        
+      case i: CredentialItem.Password =>
+        val password = System.console.readPassword("%s: ", i.getPromptText)
+        i.setValueNoCopy(password)
+        
+      case i: CredentialItem.InformationalMessage =>
+        System.console.printf("%s\n", i.getPromptText)
+        
+      case i: CredentialItem.YesNoType =>
+        i.setValue(askYesNo(i.getPromptText))
+    }
+    true
+  }
+  
+  @scala.annotation.tailrec
+  def askYesNo(prompt: String): Boolean = {
+    System.console.readLine("%s: ", prompt).trim.toLowerCase match {
+      case "yes" => true
+      case "no" => false
+      case _ => askYesNo(prompt)
+    }
+  }
 }

@@ -1,0 +1,12 @@
+### (O)Authentication
+
+An implementation for Github's client-side [oauth][oauth] support,
+contributed by
+[softprops](https://github.com/n8han/giter8/commit/a944e7bf305319b019452aeb0450387a0be526bf).
+
+    g8 --auth login password
+
+[oauth]: http://developer.github.com/v3/oauth/
+
+This method does not require the local storage of your github
+password. An oauth access token is stored in `~/.g8/config` .
